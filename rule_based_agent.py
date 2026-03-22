@@ -17,6 +17,7 @@ from riichienv import ActionType, calculate_shanten
 from utils import (
     RED_FIVE_TILE_TYPES,
     calculate_dealinrate,
+    check_for_4th_confirm,
     get_unavailable_tile_ids,
     refine_tile_types_by_suji_visibility_tiebreak,
     representative_discard_for_tile_type,
@@ -35,9 +36,13 @@ class RuleBasedAgent:
         debug_kyoku: Optional[int] = None,
         debug_honba: Optional[int] = None,
         debug_print_obs_dict: bool = False,
+        is_hanchan: bool = True,
     ):
         self.rng = random.Random(seed)
         self.debug = debug
+        #: East–South (``True``) vs East-only (``False``); passed to
+        #: ``check_for_4th_confirm``.
+        self.is_hanchan = is_hanchan
         #: When True (with ``debug`` and kyoku/honba filters passing), print
         #: ``observation.to_dict()`` once per ``act()``.
         self.debug_print_obs_dict = debug_print_obs_dict
@@ -80,19 +85,39 @@ class RuleBasedAgent:
 
         chosen: Any = None
 
-        # High-priority non-discard actions
-        priority_order = [
-            ActionType.Ron,
-            ActionType.Tsumo,
-            ActionType.Riichi,
-            ActionType.Pass,
+        win_candidates = [
+            a
+            for a in legal_actions
+            if a.action_type in (ActionType.Ron, ActionType.Tsumo)
         ]
+        if win_candidates:
+            mjai_events = self._get_observation_events(observation)
+            if check_for_4th_confirm(
+                observation,
+                self.is_hanchan,
+                mjai_events=mjai_events,
+            ):
+                non_win = [
+                    a
+                    for a in legal_actions
+                    if a.action_type not in (ActionType.Ron, ActionType.Tsumo)
+                ]
+                if non_win:
+                    chosen = self.rng.choice(non_win)
+                else:
+                    chosen = self.rng.choice(win_candidates)
+            else:
+                chosen = self.rng.choice(win_candidates)
 
-        for atype in priority_order:
-            candidates = [a for a in legal_actions if a.action_type == atype]
-            if candidates:
-                chosen = self.rng.choice(candidates)
-                break
+        # Riichi / Pass (after win handling)
+        if chosen is None:
+            for atype in (ActionType.Riichi, ActionType.Pass):
+                candidates = [
+                    a for a in legal_actions if a.action_type == atype
+                ]
+                if candidates:
+                    chosen = self.rng.choice(candidates)
+                    break
 
         if chosen is None:
             discard_actions = [

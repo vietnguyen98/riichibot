@@ -1,7 +1,9 @@
+import json
 import re
-from typing import Any, Optional, Sequence, Set
+from typing import Any, Optional, Sequence, Set, Tuple
 
-from riichienv import ActionType, calculate_shanten
+from riichienv import ActionType, HandEvaluator, calculate_shanten
+from riichienv.hand import Conditions
 import riichienv.convert as cvt
 
 from chart_data import chart1_row_as_dict, chart2_row_as_dict
@@ -20,6 +22,160 @@ def _obs_attr(obs: Any, name: str, default=None):
 
 def tid_to_mpsz(tid: int) -> str:
     return cvt.tid_to_mpsz(tid)
+
+
+def _mjai_parse_event(raw: Any) -> Optional[dict]:
+    """Parse one MJAI log entry (JSON string or dict)."""
+    try:
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def last_ron_dahai_from_mjai_events(
+    mjai_events: Optional[Sequence[Any]],
+    *,
+    observing_player_id: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Walk **chronological** MJAI ``events`` and return ``(actor, pai)`` for the
+    most recent ``dahai`` that can be a ron target: ``pai`` is not ``'?'``, and
+    if ``observing_player_id`` is set, ``actor`` must differ (ron is off another
+    seat's discard).
+
+    Returns ``(None, None)`` if none found.
+    """
+    if not mjai_events:
+        return None, None
+    last_actor: Optional[int] = None
+    last_pai: Optional[str] = None
+    pid = observing_player_id
+    for raw in mjai_events:
+        ev = _mjai_parse_event(raw)
+        if not ev or ev.get("type") != "dahai":
+            continue
+        actor = ev.get("actor")
+        pai = ev.get("pai")
+        if actor is None or pai is None:
+            continue
+        spai = str(pai).strip()
+        if spai in ("?", ""):
+            continue
+        aid = int(actor)
+        if pid is not None and aid == int(pid):
+            continue
+        last_actor, last_pai = aid, spai
+    return last_actor, last_pai
+
+
+def check_for_4th_confirm(
+    observation: Any,
+    is_hanchan: bool = True,
+    *,
+    mjai_events: Optional[Sequence[Any]] = None,
+) -> bool:
+    """
+    If ``True``, callers (e.g. ``RuleBasedAgent.act``) should not take Ron/Tsumo
+    and should pick another legal action instead (e.g. pending 4th confirm).
+    If ``False``, wins may be declared when offered.
+
+    ``is_hanchan`` reflects East–South (hanchan) vs East-only (tonpu); use when
+    interpreting ``WinResult`` / conditions (not used in the skeleton yet).
+
+    ``mjai_events``: MJAI-style log (same as ``RuleBasedAgent`` uses). For a
+    **13-tile** hand (ron), the winning tile is taken from the latest qualifying
+    ``dahai`` via :func:`last_ron_dahai_from_mjai_events`, excluding self-discard
+    using ``observation.player_id``.
+
+    Skeleton: builds ``HandEvaluator``, runs ``calc``, always returns ``False``.
+    """
+    hand = _obs_attr(observation, "hand")
+    if not hand:
+        return False
+
+    tids = [int(t) for t in list(hand)]
+
+    if len(tids) < 13:
+        return False
+
+    ron_from_seat: Optional[int] = None
+
+    # 14 tiles: treat last as drawn winning tile (tsumo-style); 13: need ron tile on obs.
+    if len(tids) >= 14:
+        body_tids = tids[:-1]
+        win_tile = tids[-1]
+    else:
+        body_tids = tids
+        win_tile = _obs_attr(observation, "ron_tile")
+        if win_tile is None:
+            win_tile = _obs_attr(observation, "win_tile")
+        if win_tile is None:
+            win_tile = _obs_attr(observation, "agari_tile")
+        if win_tile is None:
+            pid = _obs_attr(observation, "player_id")
+            observing_seat = int(pid) if pid is not None else None
+            ron_from_seat, ron_pai = last_ron_dahai_from_mjai_events(
+                mjai_events,
+                observing_player_id=observing_seat,
+            )
+            if ron_pai is None:
+                return False
+            win_tile = int(cvt.mpsz_to_tid(ron_pai))
+        else:
+            win_tile = int(win_tile)
+
+    hand_text = "".join(cvt.tid_to_mpsz(t) for t in body_tids)
+    he = HandEvaluator.hand_from_text(hand_text)
+
+    dora_indicators = list(_obs_attr(observation, "dora_indicators") or [])
+    round_wind = _obs_attr(observation, "round_wind")
+    player_wind = (int(observation.player_id) - int(observation.oya)) % 4
+    riichi_sticks = _obs_attr(observation, "riichi_sticks")
+    honba = _obs_attr(observation, "honba")
+    ura: list[int] = []
+
+    tsumo = ...
+    riichi = ...
+    # double_riichi = False
+    # ippatsu = False
+    # chankan = False
+    # haitei = False
+    # houtei = False
+    # rinshan = False
+    # tsumo_first_turn = False
+    todo: riichi from observation riichi_declared
+    tsumo from action types (Ron, Tsumo)
+    ura indicators - calculate based on which ones maximize my potential score, counting dora_indicators
+    # let's set the rest to false for now and try and just test if the function works w/out crashing agent
+
+    winres = he.calc(
+        int(win_tile),
+        dora_indicators=dora_indicators,
+        ura_indicators=...,
+        conditions=Conditions(tsumo=tsumo, riichi=riichi, double_riichi=double_riichi, ippatsu=ippatsu,
+        chankan=chankan, haitei=haitei, houtei=houtei, rinshan=rinshan, tsumo_first_turn=tsumo_first_turn, 
+        player_wind=player_wind, round_wind=round_wind, riichi_sticks=riichi_sticks, honba=honba),
+    )
+
+    print("condition params: ", "win_tile: ", win_tile, "dora_indicators: ", dora_indicators, 
+        "ura_indicators: ", ura, "tsumo: ", tsumo, "riichi: ", riichi, 
+        "double_riichi: ", double_riichi, "ippatsu: ", ippatsu, 
+        "chankan: ", chankan, "haitei: ", haitei, "houtei: ", houtei, 
+        "rinshan: ", rinshan, "tsumo_first_turn: ", tsumo_first_turn, 
+        "player_wind: ", player_wind, "round_wind: ", round_wind, 
+        "riichi_sticks: ", riichi_sticks, "honba: ", honba)
+
+    _ = (winres, is_hanchan, ron_from_seat)
+    print("winres: ", winres.ron_agari)
+    print("winres: ", winres.tsumo_agari_oya)
+    print("winres: ", winres.tsumo_agari_ko)
+    print("is_hanchan: ", is_hanchan)
+    print("ron_from_seat: ", ron_from_seat)
+    return False
 
 
 def get_unavailable_tile_ids(obs) -> Set[int]:
