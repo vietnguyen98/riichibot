@@ -1,9 +1,12 @@
-from typing import Any, Optional, Set
+import re
+from typing import Any, Optional, Sequence, Set
 
 from riichienv import ActionType, calculate_shanten
 import riichienv.convert as cvt
 
-from chart_data import chart2_row_as_dict
+from chart_data import chart1_row_as_dict, chart2_row_as_dict
+
+_MPSZ_PAI_RE = re.compile(r"^(\d+)([mps])r?$", re.IGNORECASE)
 
 
 def _obs_attr(obs: Any, name: str, default=None):
@@ -302,8 +305,12 @@ def calculate_honor_dealinrate(
     - Classifies the tile as yakuhai vs guest wind for the given `player_id`
       (round wind, seat wind, dragons).
     - Counts copies of this tile type in `get_unavailable_tile_ids(observation)`
-      (our hand + public info only — not opponents' concealed hands):
-      0 = live, 1 / 2 → Chart 2 ``_1_visible`` / ``_2_visible``; 3+ → deal-in 0.
+      (our hand + public info only — not opponents' concealed hands). Chart column:
+
+      - **0 or 1** visible → ``*_live``
+      - **2** visible → ``*_1_visible``
+      - **3** visible → ``*_2_visible``
+      - **4+** visible → deal-in **0** (all copies accounted for).
     - Looks up `chart_data.CHART2` row for `turn_passed` (clamped 1–19).
     """
     if not _is_honor_tile_type(tile_type):
@@ -313,10 +320,17 @@ def calculate_honor_dealinrate(
     is_yakuhai = tt in yakuhai_tile_types(observation, int(player_id))
     in_play_count = _count_tile_type_in_unavailable(observation, tt)
 
-    if in_play_count >= 3:
+    if in_play_count >= 4:
         return 0.0
 
-    # in_play_count is 0, 1, or 2 → live / 1_visible / 2_visible
+    # 0–1 → live (0), 2 → 1_visible (1), 3 → 2_visible (2)
+    if in_play_count <= 1:
+        chart_idx = 0
+    elif in_play_count == 2:
+        chart_idx = 1
+    else:
+        chart_idx = 2
+
     turn = max(1, min(19, int(turn_passed)))
     row = chart2_row_as_dict(turn)
     if row is None:
@@ -324,24 +338,232 @@ def calculate_honor_dealinrate(
 
     if is_yakuhai:
         col = ("yakuhai_live", "yakuhai_1_visible", "yakuhai_2_visible")[
-            in_play_count
+            chart_idx
         ]
     else:
         col = ("guest_wind_live", "guest_wind_1_visible", "guest_wind_2_visible")[
-            in_play_count
+            chart_idx
         ]
 
     return float(row[col])
 
 
-def calculate_suji_dealinrate(player_id: int, tile_type: int) -> float:
-    """
-    Estimate deal-in risk (0–100) when discarding this suited tile type.
+def _parse_mpsz_pai(pai: str) -> Optional[tuple[int, str]]:
+    """Parse MJAI tile strings like '5m', '5mr', '12p' -> (rank, suit)."""
+    m = _MPSZ_PAI_RE.match(str(pai).strip())
+    if not m:
+        return None
+    return (int(m.group(1)), m.group(2).lower())
 
-    Skeleton: replace with suji / chart_data-based logic.
+
+def _mpsz_pool_from_pairs(
+    discards: Sequence[tuple[str, bool]],
+    extended: Sequence[tuple[str, bool]],
+) -> set[tuple[int, str]]:
+    """Unique (rank, suit) seen in this player's discards + extended pond."""
+    out: set[tuple[int, str]] = set()
+    for seq in (discards, extended):
+        for pai, _ in seq:
+            pr = _parse_mpsz_pai(pai)
+            if pr:
+                out.add(pr)
+    return out
+
+
+def _pool_has(pool: set[tuple[int, str]], rank: int, suit: str) -> bool:
+    return (rank, suit) in pool
+
+
+def _tile_type_to_rank_suit(tile_type: int) -> Optional[tuple[int, str]]:
+    """Suited tile types only: 0–8 man, 9–17 pin, 18–26 sou."""
+    tt = int(tile_type)
+    if 0 <= tt <= 8:
+        return (tt + 1, "m")
+    if 9 <= tt <= 17:
+        return (tt - 8, "p")
+    if 18 <= tt <= 26:
+        return (tt - 17, "s")
+    return None
+
+
+def _chart1_column_for_suji_category(
+    rank: int,
+    suit: str,
+    pool: set[tuple[int, str]],
+) -> str:
     """
-    _ = player_id, tile_type
-    return 0.0
+    Map (rank, suit) discard to a CHART1_COLUMN_LABELS key (non_/half_/full_).
+    Pool = (rank, suit) from player's discards + extended_discards (MPSZ).
+    """
+    # --- 5 : neighbors 2 and 8 ---
+    if rank == 5:
+        a = _pool_has(pool, 2, suit)
+        b = _pool_has(pool, 8, suit)
+        if a and b:
+            return "full_5"
+        if a or b:
+            return "half_5"
+        return "non_5"
+
+    # --- 4 and 6 : two ±3 neighbors; closer-to-terminal side for 46A/46B ---
+    if rank == 4:
+        closer, other = 1, 7  # 1m side vs 7m side
+        c_ok = _pool_has(pool, closer, suit)
+        o_ok = _pool_has(pool, other, suit)
+        if c_ok and o_ok:
+            return "full_46"
+        if c_ok and not o_ok:
+            return "half_46A"
+        if o_ok and not c_ok:
+            return "half_46B"
+        return "non_46"
+
+    if rank == 6:
+        closer, other = 3, 9
+        c_ok = _pool_has(pool, closer, suit)
+        o_ok = _pool_has(pool, other, suit)
+        if c_ok and o_ok:
+            return "full_46"
+        if c_ok and not o_ok:
+            return "half_46A"
+        if o_ok and not c_ok:
+            return "half_46B"
+        return "non_46"
+
+    # --- 1,2,3,7,8,9 : single tile three steps toward middle ---
+    neighbor: Optional[int] = None
+    band: str = ""
+
+    if rank == 1:
+        neighbor = 4
+        band = "19"
+    elif rank == 9:
+        neighbor = 6
+        band = "19"
+    elif rank == 2:
+        neighbor = 5
+        band = "28"
+    elif rank == 8:
+        neighbor = 5
+        band = "28"
+    elif rank == 3:
+        neighbor = 6
+        band = "37"
+    elif rank == 7:
+        neighbor = 4
+        band = "37"
+    else:
+        # rank 5 and 4,6 handled above
+        return "non_5"
+
+    seen = _pool_has(pool, neighbor, suit)
+    if band == "19":
+        return "half_19" if seen else "non_19"
+    if band == "28":
+        return "half_28" if seen else "non_28"
+    if band == "37":
+        return "half_37" if seen else "non_37"
+    return "non_5"
+
+
+# MJAI-style honor tokens in dahai logs (winds / dragons).
+_HONOR_TILE_TYPE_MJAI: dict[int, str] = {
+    27: "E",
+    28: "S",
+    29: "W",
+    30: "N",
+    31: "P",
+    32: "F",
+    33: "C",
+}
+
+
+def check_safe_tile(
+    tile_type: int,
+    *,
+    discards_mpsz: Sequence[tuple[str, bool]] = (),
+    extended_discards_mpsz: Sequence[tuple[str, bool]] = (),
+) -> bool:
+    """
+    True if this tile type already appears in the player's discard lists
+    (``discards_mpsz`` or ``extended_discards_mpsz``), i.e. treated as safe → 0 deal-in.
+    """
+    tt = int(tile_type)
+    rs = _tile_type_to_rank_suit(tt)
+    if rs is not None:
+        pool = _mpsz_pool_from_pairs(discards_mpsz, extended_discards_mpsz)
+        return _pool_has(pool, rs[0], rs[1])
+
+    mjai = _HONOR_TILE_TYPE_MJAI.get(tt)
+    if mjai is not None:
+        for seq in (discards_mpsz, extended_discards_mpsz):
+            for pai, _ in seq:
+                if str(pai).strip().upper() == mjai:
+                    return True
+        return False
+
+    return False
+
+
+def calculate_suji_dealinrate(
+    player_id: int,
+    tile_type: int,
+    turn_passed: int = 1,
+    *,
+    discards_mpsz: Sequence[tuple[str, bool]] = (),
+    extended_discards_mpsz: Sequence[tuple[str, bool]] = (),
+) -> float:
+    """
+    Deal-in rate from Chart 1 for a suited discard, using suji classification
+    vs this player's ``discards_mpsz`` + ``extended_discards_mpsz`` (MJAI strings).
+
+    ``player_id`` is reserved for future use (e.g. seat-specific rules).
+    """
+    _ = player_id
+    rs = _tile_type_to_rank_suit(tile_type)
+    if rs is None:
+        return 0.0
+
+    rank, suit = rs
+    pool = _mpsz_pool_from_pairs(discards_mpsz, extended_discards_mpsz)
+    col = _chart1_column_for_suji_category(rank, suit, pool)
+
+    turn = max(1, min(19, int(turn_passed)))
+    row = chart1_row_as_dict(turn)
+    if row is None:
+        return 0.0
+    val = row.get(col)
+    if val is None:
+        return 0.0
+    return float(val)
+
+
+def refine_tile_types_by_suji_visibility_tiebreak(
+    observation: Any,
+    tile_types: list[int],
+) -> list[int]:
+    """
+    When several **suited** tile types share the same suji deal-in rate (e.g. in
+    ``fold()``), prefer discarding types with more copies already visible in public
+    information. Score is ``min(4, count)`` from ``get_unavailable_tile_ids``, so
+    tiers are **0–4** (4 means four or more visible); higher is preferred.
+
+    Honor tile types (27–33) are passed through unchanged; the filter applies only
+    among non-honor entries in ``tile_types``.
+    """
+    if not tile_types:
+        return tile_types
+    honors = [tt for tt in tile_types if _is_honor_tile_type(tt)]
+    suited = [tt for tt in tile_types if not _is_honor_tile_type(tt)]
+    if not suited:
+        return list(tile_types)
+    scores = {
+        tt: min(4, _count_tile_type_in_unavailable(observation, tt))
+        for tt in suited
+    }
+    mx = max(scores.values())
+    suited_kept = [tt for tt in suited if scores[tt] == mx]
+    return honors + suited_kept
 
 
 def calculate_dealinrate(
@@ -349,16 +571,41 @@ def calculate_dealinrate(
     player_id: int,
     discard_actions,
     turn_passed: int = 1,
+    *,
+    rule_agent: Any = None,
+    suji_discards_mpsz: Optional[Sequence[tuple[str, bool]]] = None,
+    suji_extended_mpsz: Optional[Sequence[tuple[str, bool]]] = None,
 ) -> dict[int, float]:
     """
     For each tile type present in legal discard actions, return an estimated
     deal-in rate on a 0–100 scale.
 
+    If ``check_safe_tile`` is true for a tile type (already in discards /
+    extended discards), the rate is ``0`` before honor/suji charts.
+
     Honor tile types (27–33) use `calculate_honor_dealinrate`; all others use
     `calculate_suji_dealinrate`.
 
-    `turn_passed` selects the Chart 2 row (1–19) for honor deal-in rates.
+    `turn_passed` selects chart rows (Chart 2 honors, Chart 1 suji).
+
+    For suji, pass ``rule_agent`` (e.g. ``RuleBasedAgent``) so
+    ``discards_by_player`` / ``extended_discards_by_player`` MJAI lists are used,
+    or set ``suji_discards_mpsz`` / ``suji_extended_mpsz`` explicitly.
     """
+    disc_pairs: Sequence[tuple[str, bool]] = suji_discards_mpsz or ()
+    ext_pairs: Sequence[tuple[str, bool]] = suji_extended_mpsz or ()
+    if rule_agent is not None:
+        if suji_discards_mpsz is None:
+            disc_pairs = list(
+                getattr(rule_agent, "discards_by_player", {}).get(player_id, [])
+            )
+        if suji_extended_mpsz is None:
+            ext_pairs = list(
+                getattr(rule_agent, "extended_discards_by_player", {}).get(
+                    player_id, []
+                )
+            )
+
     tile_types: set[int] = set()
     for action in discard_actions:
         at = getattr(action, "action_type", None)
@@ -371,6 +618,14 @@ def calculate_dealinrate(
 
     out: dict[int, float] = {}
     for tile_type in sorted(tile_types):
+        if check_safe_tile(
+            tile_type,
+            discards_mpsz=disc_pairs,
+            extended_discards_mpsz=ext_pairs,
+        ):
+            out[tile_type] = 0.0
+            continue
+
         if _is_honor_tile_type(tile_type):
             out[tile_type] = float(
                 calculate_honor_dealinrate(
@@ -381,7 +636,15 @@ def calculate_dealinrate(
                 )
             )
         else:
-            out[tile_type] = float(calculate_suji_dealinrate(player_id, tile_type))
+            out[tile_type] = float(
+                calculate_suji_dealinrate(
+                    player_id,
+                    tile_type,
+                    turn_passed=turn_passed,
+                    discards_mpsz=disc_pairs,
+                    extended_discards_mpsz=ext_pairs,
+                )
+            )
 
     # Clamp to [0, 100] for safety once helpers are implemented
     for k in list(out.keys()):
